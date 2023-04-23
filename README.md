@@ -16,19 +16,21 @@ REPRODUCIBILITY OF THE PERFORMANCE NUMBER.
 ## Steps
 
 ```bash
-make runtime
 # you might comment out some unneeded intermediate pipelines from
 # scripts/download-convert-optimize-pipelines.sh
+make converter
 make pipelines
+
+make runtime
 make benchmark-ort
 make benchmark-torch
 ```
 
 ## Results
 
-Batch size, abbr. as BS
-Latency in seconds
-Memory in MB
+- Batch size, abbr. as BS
+- Latency in seconds
+- Memory in MB
 
 ### MI250X (1 GCD)
 
