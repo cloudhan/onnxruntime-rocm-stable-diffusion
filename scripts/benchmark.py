@@ -178,6 +178,47 @@ def measure_gpu_memory(monitor_type, func, start_memory=None):
     return None
 
 
+def recursive_visit(obj, func, visited=None):
+    def recursive_visit_impl(visited, obj, func):
+        if id(obj) in visited:
+            return
+
+        visited.add(id(obj))
+        func(obj)
+
+        if isinstance(obj, (int, float, bool, str, bytes)) or obj is None:
+            return
+
+        if isinstance(obj, (list, tuple, set)):
+            for v in obj:
+                func(v)
+                recursive_visit_impl(visited, v, func)
+            return
+
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                func(k)
+                func(v)
+                recursive_visit_impl(visited, k, func)
+                recursive_visit_impl(visited, v, func)
+            return
+
+        if getattr(obj, "__dict__", None) is not None:
+            for k, v in vars(obj).items():
+                func(k)
+                func(v)
+                recursive_visit_impl(visited, k, func)
+                recursive_visit_impl(visited, v, func)
+        else:
+            print("    >>>> recursive_visit cannot process", type(obj))
+
+    if visited is None:
+        visited = set()
+    visited.add(id(visited))
+    visited.add(id(func))
+    recursive_visit_impl(visited, obj, func)
+
+
 def get_ort_pipeline(model_name: str, directory: str, provider, disable_safety_checker: bool):
     from diffusers import DDIMScheduler, OnnxStableDiffusionPipeline
 
@@ -390,15 +431,40 @@ def run_ort(
     start_memory,
     memory_monitor_type,
     tuning: bool,
+    tuning_results_load_path,
+    tuning_results_save_path,
 ):
+    import json
+    import onnxruntime
+    from onnxruntime.tools import offline_tuning
+
     provider_and_options = provider
     if tuning and provider in ["CUDAExecutionProvider", "ROCMExecutionProvider"]:
-        provider_and_options = (provider, {"tunable_op_enable": 1, "tunable_op_tuning_enable": 1})
+        provider_and_options = (
+            provider,
+            {"tunable_op_enable": 1, "tunable_op_tuning_enable": 1, "tunable_op_max_tuning_duration_ms": 500},
+        )
 
     load_start = time.time()
     pipe = get_ort_pipeline(model_name, directory, provider_and_options, disable_safety_checker)
     load_end = time.time()
     print(f"Model loading took {load_end - load_start} seconds")
+
+
+    sessions = {}
+    if tuning_results_load_path or tuning_results_save_path:
+        def get_all_sessions(obj):
+            if isinstance(obj, onnxruntime.InferenceSession):
+                sessions[id(obj)] = obj
+
+        recursive_visit(pipe, get_all_sessions)
+
+    if tuning_results_load_path:
+        if os.path.exists(tuning_results_load_path):
+            for _, sess in sessions.items():
+                sess.set_tuning_results(json.load(open(tuning_results_load_path)))
+        else:
+            print(f"Cannot find tuning results {tuning_results_load_path}")
 
     image_filename_prefix = get_image_filename_prefix("ort", model_name, batch_size, disable_safety_checker)
     result = run_ort_pipeline(
@@ -423,6 +489,13 @@ def run_ort(
             "enable_cuda_graph": False,
         }
     )
+
+    if tuning_results_save_path:
+        m = offline_tuning.Merger()
+        for _, sess in sessions.items():
+            m.merge(sess.get_tuning_results())
+        json.dump(m.get_merged(), open(tuning_results_save_path, "w"))
+
     return result
 
 
@@ -790,6 +863,24 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "-tl",
+        "--tuning_results_load_path",
+        required=False,
+        default=None,
+        type=str,
+        help="Load tuning results from the path for the InferenceSessions."
+    )
+
+    parser.add_argument(
+        "-ts",
+        "--tuning_results_save_path",
+        required=False,
+        default=None,
+        type=str,
+        help="Merge and save tuning results to the path from the InferenceSessions.",
+    )
+
+    parser.add_argument(
         "-v",
         "--version",
         required=False,
@@ -1005,6 +1096,8 @@ def main():
             start_memory,
             memory_monitor_type,
             args.tuning,
+            args.tuning_results_load_path,
+            args.tuning_results_save_path,
         )
     elif args.engine == "tensorrt":
         result = run_tensorrt(
